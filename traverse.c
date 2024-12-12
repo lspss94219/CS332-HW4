@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h>
-#include <process.h> // For _beginthreadex
-#include <time.h>    // For random number generation
+#include <unistd.h>    // For pipe, read, write, fork
+#include <pthread.h>   // For pthread_create, pthread_mutex
+#include <signal.h>    // For signals
+#include <time.h>      // For nanosleep
+#include "file_operations.h" // Ensure this is available
 
 #define NUM_PARENT_THREADS 3
 #define NUM_CHILD_THREADS 10
@@ -10,156 +12,159 @@
 #define VALUES_PER_CHILD_THREAD 150
 #define TOTAL_VALUES (NUM_PARENT_THREADS * NUM_VALUES_PER_THREAD)
 
-// Shared anonymous pipe
-HANDLE pipe_read, pipe_write;
+// Shared pipe
+int pipe_fds[2];
 
 // Mutex for pipe synchronization
-HANDLE pipe_mutex;
+pthread_mutex_t pipe_mutex;
 
-// Event for signaling the child process
-HANDLE parent_done_event;
+// Signal flag for child process
+volatile sig_atomic_t parent_done = 0;
 
-// Function to write results to a file
-void save_result_to_file(const char* filename, double average) {
-    FILE* file = fopen(filename, "w");
-    if (file) {
-        fprintf(file, "Average: %lf\n", average);
-        fclose(file);
-    } else {
-        perror("Failed to open result file");
+// Signal handler for child process
+void signal_handler(int sig) {
+    if (sig == SIGUSR1) {
+        parent_done = 1;
     }
 }
 
 // Parent thread function
-unsigned __stdcall parent_thread_function(void* arg) {
+void* parent_thread_function(void* arg) {
     int thread_id = *(int*)arg;
 
     for (int i = 0; i < NUM_VALUES_PER_THREAD; i++) {
         int random_value = rand() % 1000;
 
         // Synchronize pipe writes
-        WaitForSingleObject(pipe_mutex, INFINITE);
-        DWORD bytes_written;
-        if (!WriteFile(pipe_write, &random_value, sizeof(random_value), &bytes_written, NULL)) {
-            fprintf(stderr, "WriteFile failed for Parent Thread %d\n", thread_id);
+        pthread_mutex_lock(&pipe_mutex);
+        if (write(pipe_fds[1], &random_value, sizeof(random_value)) == -1) {
+            perror("write");
         } else {
             printf("Parent Thread %d wrote: %d\n", thread_id, random_value);
         }
-        ReleaseMutex(pipe_mutex);
+        pthread_mutex_unlock(&pipe_mutex);
 
-        Sleep(1); // Simulate processing delay
+        struct timespec ts = {0, 1000000}; // 1 millisecond
+        nanosleep(&ts, NULL); // Replace deprecated usleep
     }
 
-    return 0;
+    return NULL;
 }
 
 // Child thread function
-unsigned __stdcall child_thread_function(void* arg) {
+void* child_thread_function(void* arg) {
     int thread_id = *(int*)arg;
     int sum = 0;
 
     for (int i = 0; i < VALUES_PER_CHILD_THREAD; i++) {
         int value;
-        DWORD bytes_read;
-
-        // Read value from the pipe
-        if (!ReadFile(pipe_read, &value, sizeof(value), &bytes_read, NULL) || bytes_read == 0) {
-            fprintf(stderr, "ReadFile failed for Child Thread %d\n", thread_id);
-            break;
+        ssize_t bytes_read = read(pipe_fds[0], &value, sizeof(value));
+        if (bytes_read == 0) break; // End of pipe
+        if (bytes_read > 0) {
+            sum += value;
+            printf("Child Thread %d read: %d\n", thread_id, value);
+        } else {
+            perror("read");
         }
-
-        sum += value;
-        printf("Child Thread %d read: %d\n", thread_id, value);
     }
 
     // Return the sum as the thread's result
-    int* result = (int*)malloc(sizeof(int));
+    int* result = malloc(sizeof(int));
     *result = sum;
-    return (unsigned)result;
+    return result;
 }
 
 int main() {
-    HANDLE parent_threads[NUM_PARENT_THREADS];
+    pthread_t parent_threads[NUM_PARENT_THREADS];
     int parent_thread_ids[NUM_PARENT_THREADS];
 
-    HANDLE child_threads[NUM_CHILD_THREADS];
+    pthread_t child_threads[NUM_CHILD_THREADS];
     int child_thread_ids[NUM_CHILD_THREADS];
 
-    // Initialize random number generator
-    srand((unsigned int)time(NULL));
-
-    // Create anonymous pipe
-    if (!CreatePipe(&pipe_read, &pipe_write, NULL, 0)) {
-        fprintf(stderr, "Failed to create pipe\n");
+    // Initialize mutex
+    if (pthread_mutex_init(&pipe_mutex, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize mutex.\n");
         return 1;
     }
 
-    // Create mutex for pipe synchronization
-    pipe_mutex = CreateMutex(NULL, FALSE, NULL);
-    if (pipe_mutex == NULL) {
-        fprintf(stderr, "Failed to create mutex\n");
+    // Create a pipe
+    if (pipe(pipe_fds) == -1) {
+        perror("pipe");
         return 1;
     }
 
-    // Create event for signaling the child process
-    parent_done_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (parent_done_event == NULL) {
-        fprintf(stderr, "Failed to create event\n");
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
         return 1;
     }
 
-    // Create child threads
-    printf("Starting child threads...\n");
-    int total_sum = 0;
-    for (int i = 0; i < NUM_CHILD_THREADS; i++) {
-        child_thread_ids[i] = i;
-        child_threads[i] = (HANDLE)_beginthreadex(NULL, 0, child_thread_function, &child_thread_ids[i], 0, NULL);
-        if (child_threads[i] == NULL) {
-            fprintf(stderr, "Failed to create Child Thread %d\n", i);
-            return 1;
+    if (pid == 0) { // Child process
+        // Register signal handler using sigaction
+        struct sigaction sa;
+        sa.sa_handler = signal_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGUSR1, &sa, NULL);
+
+        printf("Child process waiting for signal from parent...\n");
+
+        // Wait for the parent signal
+        while (!parent_done) {
+            struct timespec ts = {0, 1000000}; // 1 millisecond
+            nanosleep(&ts, NULL);
         }
-    }
 
-    // Create parent threads
-    printf("Starting parent threads...\n");
-    for (int i = 0; i < NUM_PARENT_THREADS; i++) {
-        parent_thread_ids[i] = i;
-        parent_threads[i] = (HANDLE)_beginthreadex(NULL, 0, parent_thread_function, &parent_thread_ids[i], 0, NULL);
-        if (parent_threads[i] == NULL) {
-            fprintf(stderr, "Failed to create Parent Thread %d\n", i);
-            return 1;
+        printf("Child process received signal. Starting...\n");
+
+        // Create child threads
+        int total_sum = 0;
+        for (int i = 0; i < NUM_CHILD_THREADS; i++) {
+            child_thread_ids[i] = i;
+            if (pthread_create(&child_threads[i], NULL, child_thread_function, &child_thread_ids[i]) != 0) {
+                fprintf(stderr, "Failed to create child thread %d.\n", i);
+                return 1;
+            }
         }
+
+        // Collect results from child threads
+        for (int i = 0; i < NUM_CHILD_THREADS; i++) {
+            int* result;
+            pthread_join(child_threads[i], (void**)&result);
+            total_sum += *result;
+            free(result);
+        }
+
+        // Calculate the average
+        double average = (double)total_sum / TOTAL_VALUES;
+        save_result_to_file("result_output.txt", average);
+
+        printf("Child process completed. Average saved to file.\n");
+        return 0;
+    } else { // Parent process
+        printf("Parent process starting threads...\n");
+
+        // Create parent threads
+        for (int i = 0; i < NUM_PARENT_THREADS; i++) {
+            parent_thread_ids[i] = i;
+            if (pthread_create(&parent_threads[i], NULL, parent_thread_function, &parent_thread_ids[i]) != 0) {
+                fprintf(stderr, "Failed to create parent thread %d.\n", i);
+                return 1;
+            }
+        }
+
+        // Wait for parent threads to finish
+        for (int i = 0; i < NUM_PARENT_THREADS; i++) {
+            pthread_join(parent_threads[i], NULL);
+        }
+
+        // Notify child process
+        kill(pid, SIGUSR1);
+
+        printf("Parent process completed.\n");
+        close(pipe_fds[1]); // Close the write end
     }
-
-    // Wait for parent threads to finish
-    WaitForMultipleObjects(NUM_PARENT_THREADS, parent_threads, TRUE, INFINITE);
-    printf("Parent threads completed.\n");
-
-    // Signal child threads to start processing
-    SetEvent(parent_done_event);
-
-    // Wait for child threads to finish and collect results
-    WaitForMultipleObjects(NUM_CHILD_THREADS, child_threads, TRUE, INFINITE);
-    for (int i = 0; i < NUM_CHILD_THREADS; i++) {
-        DWORD exit_code;
-        GetExitCodeThread(child_threads[i], &exit_code);
-        total_sum += (int)exit_code;
-        CloseHandle(child_threads[i]);
-    }
-
-    // Calculate and save the average
-    double average = (double)total_sum / TOTAL_VALUES;
-    save_result_to_file("result_output.txt", average);
-    printf("Child threads completed. Average saved to file.\n");
-
-    // Clean up
-    for (int i = 0; i < NUM_PARENT_THREADS; i++) {
-        CloseHandle(parent_threads[i]);
-    }
-    CloseHandle(pipe_read);
-    CloseHandle(pipe_write);
-    CloseHandle(pipe_mutex);
-    CloseHandle(parent_done_event);
 
     return 0;
 }
